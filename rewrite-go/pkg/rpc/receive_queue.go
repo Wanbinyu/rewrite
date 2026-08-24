@@ -146,6 +146,9 @@ func (q *ReceiveQueue) Receive(before any, onChange func(any) any) any {
 		} else if !isNilValue(before) && getValueType(before) != nil {
 			if t, ok := before.(java.Tree); ok {
 				after = defaultReceiver.Visit(t, q)
+			} else if msg.Value != nil {
+				// A codec-less value-typed scalar (e.g. an operator enum)
+				after = msg.Value
 			} else if codecExpected {
 				panic(missingCodec(*msg.ValueType))
 			} else {
@@ -260,15 +263,30 @@ func convertTo[T any](v any) T {
 	if t, ok := v.(T); ok {
 		return t
 	}
-	// Handle float64 -> int64 conversion (common with JSON)
+	// A number arrives in the Go type its JSON shape implies (see decodeNumber),
+	// which need not be the one the field it fills holds.
 	var zero T
 	switch any(zero).(type) {
 	case int64:
 		switch n := v.(type) {
-		case float64:
-			return any(int64(n)).(T)
 		case int:
 			return any(int64(n)).(T)
+		case float64:
+			return any(int64(n)).(T)
+		}
+	case int:
+		switch n := v.(type) {
+		case int64:
+			return any(int(n)).(T)
+		case float64:
+			return any(int(n)).(T)
+		}
+	case float64:
+		switch n := v.(type) {
+		case int:
+			return any(float64(n)).(T)
+		case int64:
+			return any(float64(n)).(T)
 		}
 	case string:
 		if s, ok := v.(string); ok {

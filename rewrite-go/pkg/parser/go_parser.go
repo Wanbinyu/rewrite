@@ -24,6 +24,8 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"math"
+	"math/big"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -92,6 +94,17 @@ func (gp *GoParser) Parse(sourcePath string, source string) (*golang.Compilation
 	return cus[0], nil
 }
 
+// PackageParseError names the file whose syntax error stopped a package from
+// parsing, so callers reporting per-file can tell the offender from its siblings.
+type PackageParseError struct {
+	Path string
+	Err  error
+}
+
+func (e *PackageParseError) Error() string { return fmt.Sprintf("parse %s: %v", e.Path, e.Err) }
+
+func (e *PackageParseError) Unwrap() error { return e.Err }
+
 // ParsePackage parses every file in a single Go package together so
 // type-checking sees them as one unit. File A's reference to file B's
 // symbol resolves; the resulting CompilationUnits share a single
@@ -124,7 +137,7 @@ func (gp *GoParser) ParsePackage(files []FileInput) ([]*golang.CompilationUnit, 
 	for _, f := range files {
 		a, err := parser.ParseFile(fset, f.Path, f.Content, parser.ParseComments)
 		if err != nil {
-			return nil, fmt.Errorf("parse %s: %w", f.Path, err)
+			return nil, &PackageParseError{Path: f.Path, Err: err}
 		}
 		asts = append(asts, a)
 	}
@@ -139,9 +152,19 @@ func (gp *GoParser) ParsePackage(files []FileInput) ([]*golang.CompilationUnit, 
 		// Used to distinguish generic instantiation from ordinary indexing.
 		Instances: make(map[*ast.Ident]types.Instance),
 	}
+	// Reasons the package lost part of its type attribution.
+	var partial []string
 	if !gp.ParseOnly {
+		// types.Config reads a nil Importer as resolving nothing. Wrapping one
+		// would hand it an interface holding a nil pointer, which reads as set.
+		imp := gp.Importer
+		var resilient *resilientImporter
+		if imp != nil {
+			resilient = newResilientImporter(imp)
+			imp = resilient
+		}
 		conf := types.Config{
-			Importer: gp.Importer,
+			Importer: imp,
 			// Don't fail on type errors — we want partial type info even when
 			// some imports can't be resolved.
 			Error: func(error) {},
@@ -153,8 +176,19 @@ func (gp *GoParser) ParsePackage(files []FileInput) ([]*golang.CompilationUnit, 
 		if asts[0].Name != nil {
 			pkgName = asts[0].Name.Name
 		}
-		checkTypes(&conf, pkgName, fset, asts, typeInfo)
+		recovered := checkTypes(&conf, pkgName, fset, asts, typeInfo)
+		if resilient != nil {
+			partial = append(partial, resilient.failures...)
+		}
+		partial = append(partial, degradedImports(gp.Importer, asts)...)
+		if recovered != nil {
+			partial = append(partial, fmt.Sprintf("type check ended early: %v", recovered))
+		}
 	}
+
+	// Every compilation unit of the package shares one string: they say the
+	// same thing, and each holds it for as long as the tree lives.
+	reason := strings.Join(partial, "; ")
 
 	mapper := newTypeMapper()
 	cus := make([]*golang.CompilationUnit, 0, len(files))
@@ -168,18 +202,118 @@ func (gp *GoParser) ParsePackage(files []FileInput) ([]*golang.CompilationUnit, 
 			typeInfo: typeInfo,
 			mapper:   mapper,
 		}
-		cus = append(cus, ctx.mapFile(asts[i], f.Path))
+		cu := ctx.mapFile(asts[i], f.Path)
+		if reason != "" {
+			cu.Markers = java.AddMarker(cu.Markers, golang.NewPartialTypeAttribution(reason))
+		}
+		cus = append(cus, cu)
 	}
 	return cus, nil
 }
 
-// checkTypes populates typeInfo as far as the type checker gets. Some
+// compactCause reduces an importer's error to its first line, less the phrase
+// that introduces the directories it searched. Those directories name the
+// host's GOROOT, GOPATH and user, and a reason travels in the LST, so two
+// machines have to derive the same one from the same sources.
+func compactCause(err error) string {
+	cause := err.Error()
+	if end := strings.IndexByte(cause, '\n'); end >= 0 {
+		cause = cause[:end]
+	}
+	return strings.TrimSuffix(strings.TrimSpace(cause), " in any of:")
+}
+
+// degradeReporter is implemented by importers that can name the degraded
+// packages an import path reaches.
+type degradeReporter interface {
+	DegradedReachableFrom(importPath string) []DegradedImport
+}
+
+// degradedImports names what the files import for their symbols that lost
+// something; a blank import asks for none. Asking per file,
+// rather than reading a running total off the importer, keeps one package's
+// loss off a sibling that shares the importer and its cache.
+func degradedImports(imp types.Importer, asts []*ast.File) []string {
+	reporter, ok := imp.(degradeReporter)
+	if !ok {
+		return nil
+	}
+	var reasons []string
+	seen := make(map[string]bool)
+	for _, f := range asts {
+		for _, spec := range f.Imports {
+			if spec.Name != nil && spec.Name.Name == "_" {
+				continue
+			}
+			importPath, err := strconv.Unquote(spec.Path.Value)
+			if err != nil || seen[importPath] {
+				continue
+			}
+			seen[importPath] = true
+			for _, d := range reporter.DegradedReachableFrom(importPath) {
+				if d.Path == importPath {
+					reasons = append(reasons, fmt.Sprintf("import %q: %s", d.Path, d.Reason))
+					continue
+				}
+				reasons = append(reasons, fmt.Sprintf("import %q reaches %q: %s", importPath, d.Path, d.Reason))
+			}
+		}
+	}
+	return reasons
+}
+
+// resilientImporter keeps one import's failure from costing the whole package.
+// A types.Importer that panics — which is how internal/pkgbits reports export
+// data it is too old to decode — would end conf.Check wherever it had got to,
+// leaving every later declaration unattributed.
+type resilientImporter struct {
+	delegate types.Importer
+	failures []string
+	seen     map[string]bool
+}
+
+func newResilientImporter(delegate types.Importer) *resilientImporter {
+	return &resilientImporter{delegate: delegate, seen: make(map[string]bool)}
+}
+
+func (r *resilientImporter) Import(path string) (*types.Package, error) {
+	return r.guard(path, func() (*types.Package, error) { return r.delegate.Import(path) })
+}
+
+// ImportFrom carries srcDir through to a delegate that reads it — go/types
+// passes the importing file's directory, which is what resolves vendored and
+// relative imports.
+func (r *resilientImporter) ImportFrom(path, srcDir string, mode types.ImportMode) (*types.Package, error) {
+	from, ok := r.delegate.(types.ImporterFrom)
+	if !ok {
+		return r.Import(path)
+	}
+	return r.guard(path, func() (*types.Package, error) { return from.ImportFrom(path, srcDir, mode) })
+}
+
+func (r *resilientImporter) guard(path string, imp func() (*types.Package, error)) (pkg *types.Package, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			pkg, err = nil, fmt.Errorf("%v", rec)
+		}
+		if err == nil || r.seen[path] {
+			return
+		}
+		r.seen[path] = true
+		r.failures = append(r.failures, fmt.Sprintf("could not resolve import %q: %s", path, compactCause(err)))
+	}()
+	return imp()
+}
+
+// checkTypes populates typeInfo as far as the type checker gets, returning what
+// ended the check early, or nil if it ran to completion. Some
 // malformed-but-parseable inputs — a type cycle routed through an alias,
 // for one — make go/types panic rather than report an error, and the LST
 // does not depend on type information being complete.
-func checkTypes(conf *types.Config, pkgName string, fset *token.FileSet, asts []*ast.File, typeInfo *types.Info) {
-	defer func() { recover() }()
+func checkTypes(conf *types.Config, pkgName string, fset *token.FileSet, asts []*ast.File, typeInfo *types.Info) (recovered any) {
+	defer func() { recovered = recover() }()
 	_, _ = conf.Check(pkgName, fset, asts, typeInfo)
+	return nil
 }
 
 // PackageNameOf returns the package clause name of a Go source file, or ""
@@ -1655,19 +1789,16 @@ func (ctx *parseContext) mapCaseClause(clause *ast.CaseClause) *java.Case {
 	}
 }
 
-// mapSelectStmt maps a select statement, reusing Switch+Case with SelectStmt marker.
-func (ctx *parseContext) mapSelectStmt(stmt *ast.SelectStmt) *java.Switch {
+// mapSelectStmt maps a select statement. select is not a Java switch, so it maps
+// to golang.Select — its clauses are golang.CommClause, which are not java.Case.
+func (ctx *parseContext) mapSelectStmt(stmt *ast.SelectStmt) *golang.Select {
 	prefix := ctx.prefixAndSkip(stmt.Pos(), len("select"))
 	body := ctx.mapBlockStmt(stmt.Body)
 
-	return &java.Switch{
+	return &golang.Select{
 		ID:     uuid.New(),
 		Prefix: prefix,
-		Markers: java.Markers{
-			ID:      uuid.New(),
-			Entries: []java.Marker{golang.SelectStmt{Ident: uuid.New()}},
-		},
-		Body: body,
+		Body:   body,
 	}
 }
 
@@ -1867,6 +1998,11 @@ func (ctx *parseContext) mapForStmt(stmt *ast.ForStmt) *java.ForLoop {
 			control.Prefix, cond = hoistLeftPrefix(cond)
 			condRP := java.RightPadded[java.Expression]{Element: cond}
 			control.Condition = &condRP
+		} else {
+			// Infinite `for {}`: Java models `for (;;)` with a J.Empty condition,
+			// so the field is never null. Fill it with a synthetic J.Empty rather
+			// than leaving it nil; GoPrinter omits it via the ImplicitForClauses marker.
+			control.Condition = &java.RightPadded[java.Expression]{Element: &java.Empty{ID: uuid.New()}}
 		}
 		control.Init = &java.RightPadded[java.Statement]{Element: &java.Empty{ID: uuid.New()}}
 		control.Update = &java.RightPadded[java.Statement]{Element: &java.Empty{ID: uuid.New()}}
@@ -2138,9 +2274,43 @@ func (ctx *parseContext) mapBasicLit(lit *ast.BasicLit) *java.Literal {
 
 	l := &java.Literal{ID: uuid.New(), Prefix: prefix, Value: decodeBasicLitValue(lit), Source: lit.Value}
 
-	l.Type = ctx.valueTypeOf(lit)
+	l.Type = ctx.literalTypeOf(lit)
+
+	// A Go int constant is 64-bit, but Java's int is 32-bit. When the value
+	// overflows Integer, fall back to long so the JVM LST deserializer does not
+	// reconstruct it via Integer.valueOf, which throws and drops the file.
+	if lit.Kind == token.INT {
+		if prim, ok := l.Type.(*java.JavaTypePrimitive); ok && prim.Keyword == "int" {
+			if v, ok := l.Value.(int64); ok && v > math.MaxInt32 {
+				l.Type = &java.JavaTypePrimitive{Keyword: "long"}
+			}
+		}
+	}
 
 	return l
+}
+
+// literalTypeOf resolves a literal's type through a named type's underlying
+// basic, since an untyped constant compared against a value of a named type
+// (`type Code int`; `2052 <= i` where `i Code`) is converted to that named type
+// by go/types. Nil when Go's type has no Java primitive to name it.
+func (ctx *parseContext) literalTypeOf(lit *ast.BasicLit) java.JavaType {
+	tv, ok := ctx.typeInfo.Types[lit]
+	if !ok {
+		return nil
+	}
+	t := tv.Type
+	if named, ok := types.Unalias(t).(*types.Named); ok {
+		t = named.Underlying()
+	}
+	basic, ok := t.(*types.Basic)
+	if !ok {
+		return nil
+	}
+	if prim := literalPrimitive(basic); prim != nil {
+		return prim
+	}
+	return nil
 }
 
 func decodeBasicLitValue(lit *ast.BasicLit) any {
@@ -2162,6 +2332,11 @@ func decodeBasicLitValue(lit *ast.BasicLit) any {
 		}
 	case token.INT:
 		if i, err := strconv.ParseInt(lit.Value, 0, 64); err == nil {
+			return i
+		}
+		// A Go integer constant has arbitrary precision, so one too wide for an
+		// int64 is kept as a big.Int, which the JVM side receives as a BigInteger.
+		if i, ok := new(big.Int).SetString(lit.Value, 0); ok {
 			return i
 		}
 	case token.FLOAT:
@@ -2231,6 +2406,10 @@ func (ctx *parseContext) mapBinaryExpr(expr *ast.BinaryExpr) java.Expression {
 
 // mapCallExpr maps a function/method call.
 func (ctx *parseContext) mapCallExpr(expr *ast.CallExpr) java.Expression {
+	if ctx.isConversion(expr) {
+		return ctx.mapConversion(expr)
+	}
+
 	// `Map[int](42)` / `Pair[K, V](...)`: the callee is a generic function (or
 	// type) instantiated with explicit type arguments. Go reuses *ast.IndexExpr
 	// for both this and ordinary indexing (`funcs[0]()`), so disambiguate via the
@@ -2377,26 +2556,101 @@ func (ctx *parseContext) mapCallExpr(expr *ast.CallExpr) java.Expression {
 			mi.MethodType = ctx.calleeSignature(obj, ident.Name, nil)
 		}
 	}
+	if mi.MethodType == nil {
+		if bt := ctx.builtinSignature(expr.Fun, name.Name); bt != nil {
+			mi.MethodType = bt
+			// The callee identifier carries the method type, as a declared
+			// function's does.
+			name.Type = bt
+		}
+	}
 
-	if marker := ctx.callKindMarker(expr.Fun); marker != nil {
+	if marker := ctx.builtinMarker(expr.Fun); marker != nil {
 		mi.Markers = java.AddMarker(mi.Markers, marker)
 	}
 
 	return mi
 }
 
-// callKindMarker reports whether a call's callee denotes a type (making the
-// call a conversion) or one of Go's predeclared functions.
-func (ctx *parseContext) callKindMarker(callee ast.Expr) java.Marker {
-	if tv, ok := ctx.typeInfo.Types[callee]; ok && tv.IsType() {
-		return golang.NewConversion()
-	}
+func (ctx *parseContext) builtinMarker(callee ast.Expr) java.Marker {
 	if ident, ok := callee.(*ast.Ident); ok {
 		if _, ok := ctx.typeInfo.Uses[ident].(*types.Builtin); ok {
 			return golang.NewBuiltin()
 		}
 	}
 	return nil
+}
+
+// builtinSignature types a call to a builtin. Go resolves one to a
+// *types.Builtin, whose own type is invalid, and records the signature the call
+// site instantiated on the callee expression instead. A builtin belongs to no
+// package, so it takes `builtin`, the one Go's own documentation files it under.
+func (ctx *parseContext) builtinSignature(callee ast.Expr, name string) *java.JavaTypeMethod {
+	var obj types.Object
+	switch c := callee.(type) {
+	case *ast.Ident:
+		obj = ctx.typeInfo.Uses[c]
+	case *ast.SelectorExpr:
+		obj = ctx.typeInfo.Uses[c.Sel]
+	}
+	if _, ok := obj.(*types.Builtin); !ok {
+		return nil
+	}
+	sig, ok := ctx.typeInfo.Types[callee].Type.(*types.Signature)
+	if !ok {
+		return nil
+	}
+	return ctx.mapper.mapSignature(sig, name, &java.JavaTypeClass{FullyQualifiedName: "builtin", Kind: "Class"})
+}
+
+// isConversion reports whether a call is Go's `T(x)`, which converts one value
+// to a type and is spelled exactly like a call to a function named T. Only a
+// single operand with no `...` converts, so a callee naming a type in any other
+// shape leaves a call.
+func (ctx *parseContext) isConversion(expr *ast.CallExpr) bool {
+	tv, ok := ctx.typeInfo.Types[expr.Fun]
+	return ok && tv.IsType() && len(expr.Args) == 1 && !expr.Ellipsis.IsValid()
+}
+
+// mapConversion maps `T(x)` onto the slots java.TypeCast describes.
+func (ctx *parseContext) mapConversion(expr *ast.CallExpr) java.Expression {
+	prefix, typeExpr := hoistLeftPrefix(ctx.mapTypeExpr(expr.Fun))
+
+	lparenPrefix := ctx.prefix(expr.Lparen)
+	ctx.skip(1) // "("
+
+	operand := ctx.mapExpr(expr.Args[0])
+
+	var markers java.Markers
+	var rparenPrefix java.Space
+	if commaOffset := ctx.findNextBefore(',', ctx.boundaryAt(expr.Rparen)); commaOffset >= 0 {
+		commaBefore := ctx.prefix(ctx.file.Pos(commaOffset))
+		ctx.skip(1) // ","
+		commaAfter := ctx.prefix(expr.Rparen)
+		markers = java.Markers{
+			ID: uuid.New(),
+			Entries: []java.Marker{golang.TrailingComma{
+				Ident:  uuid.New(),
+				Before: commaBefore,
+				After:  commaAfter,
+			}},
+		}
+	} else {
+		rparenPrefix = ctx.prefix(expr.Rparen)
+	}
+	ctx.skip(1) // ")"
+
+	return &java.TypeCast{
+		ID:      uuid.New(),
+		Prefix:  prefix,
+		Markers: markers,
+		Clazz: &java.ControlParentheses{
+			ID:     uuid.New(),
+			Prefix: lparenPrefix,
+			Tree:   java.RightPadded[java.Expression]{Element: typeExpr, After: rparenPrefix},
+		},
+		Expr: operand,
+	}
 }
 
 // calleeSignature is the signature a call goes through, whether the
@@ -2669,10 +2923,12 @@ func (ctx *parseContext) mapPointerType(expr *ast.StarExpr) java.Expression {
 }
 
 // mapTypeExpr maps an expression that is known to be in a type position.
-// It delegates to mapExpr but overrides StarExpr to produce PointerType
-// and IndexExpr to produce ParameterizedType (generic instantiation).
+// It delegates to mapExpr but overrides the spellings a type reads differently
+// from an expression: ParenExpr, StarExpr and IndexExpr.
 func (ctx *parseContext) mapTypeExpr(expr ast.Expr) java.Expression {
 	switch e := expr.(type) {
+	case *ast.ParenExpr:
+		return ctx.mapParenthesizedType(e)
 	case *ast.StarExpr:
 		return ctx.mapPointerType(e)
 	case *ast.IndexExpr:
@@ -2695,6 +2951,23 @@ func (ctx *parseContext) mapTypeExpr(expr ast.Expr) java.Expression {
 		return ctx.mapExpr(expr)
 	default:
 		return ctx.mapExpr(expr)
+	}
+}
+
+func (ctx *parseContext) mapParenthesizedType(expr *ast.ParenExpr) *java.ParenthesizedTypeTree {
+	prefix := ctx.prefix(expr.Lparen)
+	ctx.skip(1) // "("
+	inner := ctx.mapTypeExpr(expr.X)
+	after := ctx.prefix(expr.Rparen)
+	ctx.skip(1) // ")"
+
+	return &java.ParenthesizedTypeTree{
+		ID:     uuid.New(),
+		Prefix: prefix,
+		Type: &java.Parentheses{
+			ID:   uuid.New(),
+			Tree: java.RightPadded[java.Expression]{Element: inner, After: after},
+		},
 	}
 }
 
@@ -2985,9 +3258,9 @@ func (ctx *parseContext) mapTypeAssertExpr(expr *ast.TypeAssertExpr) java.Expres
 		Left:         java.RightPadded[java.Expression]{Element: x, After: dotPrefix},
 		AssertedType: clazz,
 	}
-	if tv, ok := ctx.typeInfo.Types[expr]; ok {
-		ta.Type = ctx.mapper.mapType(tv.Type)
-	}
+	// In the comma-ok form the checker records `(T, bool)`; valueTypeOf takes
+	// the T the assertion evaluates to either way.
+	ta.Type = ctx.valueTypeOf(expr)
 	return ta
 }
 
